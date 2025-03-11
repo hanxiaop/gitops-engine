@@ -2,6 +2,7 @@ package cache
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -17,7 +18,6 @@ import (
 	"github.com/stretchr/testify/require"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
-	v1 "k8s.io/api/core/v1"
 	extensionsv1beta1 "k8s.io/api/extensions/v1beta1"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -35,7 +35,7 @@ import (
 	"github.com/argoproj/gitops-engine/pkg/utils/kube/kubetest"
 )
 
-func mustToUnstructured(obj interface{}) *unstructured.Unstructured {
+func mustToUnstructured(obj any) *unstructured.Unstructured {
 	un, err := kube.ToUnstructured(obj)
 	if err != nil {
 		panic(err)
@@ -44,7 +44,7 @@ func mustToUnstructured(obj interface{}) *unstructured.Unstructured {
 }
 
 func strToUnstructured(jsonStr string) *unstructured.Unstructured {
-	obj := make(map[string]interface{})
+	obj := make(map[string]any)
 	err := yaml.Unmarshal([]byte(jsonStr), &obj)
 	if err != nil {
 		panic(err)
@@ -74,17 +74,18 @@ var (
       - hostname: localhost`, testCreationTime.UTC().Format(time.RFC3339)))
 )
 
-func newCluster(t testing.TB, objs ...runtime.Object) *clusterCache {
-	cache := newClusterWithOptions(t, []UpdateSettingsFunc{}, objs...)
+func newCluster(tb testing.TB, objs ...runtime.Object) *clusterCache {
+	tb.Helper()
+	cache := newClusterWithOptions(tb, []UpdateSettingsFunc{}, objs...)
 
-	t.Cleanup(func() {
+	tb.Cleanup(func() {
 		cache.Invalidate()
 	})
 
 	return cache
 }
 
-func newClusterWithOptions(t testing.TB, opts []UpdateSettingsFunc, objs ...runtime.Object) *clusterCache {
+func newClusterWithOptions(_ testing.TB, opts []UpdateSettingsFunc, objs ...runtime.Object) *clusterCache {
 	client := fake.NewSimpleDynamicClient(scheme.Scheme, objs...)
 	reactor := client.ReactionChain[0]
 	client.PrependReactor("list", "*", func(action testcore.Action) (handled bool, ret runtime.Object, err error) {
@@ -146,6 +147,48 @@ func getChildren(cluster *clusterCache, un *unstructured.Unstructured) []*Resour
 	return hierarchy[1:]
 }
 
+// Benchmark_sync is meant to simulate cluster initialization when populateResourceInfoHandler does nontrivial work.
+func Benchmark_sync(t *testing.B) {
+	resources := []runtime.Object{}
+	for i := 0; i < 100; i++ {
+		resources = append(resources, &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      fmt.Sprintf("pod-%d", i),
+				Namespace: "default",
+			},
+		}, &appsv1.ReplicaSet{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      fmt.Sprintf("rs-%d", i),
+				Namespace: "default",
+			},
+		}, &appsv1.Deployment{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      fmt.Sprintf("deploy-%d", i),
+				Namespace: "default",
+			},
+		}, &appsv1.StatefulSet{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      fmt.Sprintf("sts-%d", i),
+				Namespace: "default",
+			},
+		})
+	}
+
+	c := newCluster(t, resources...)
+
+	c.populateResourceInfoHandler = func(_ *unstructured.Unstructured, _ bool) (info any, cacheManifest bool) {
+		time.Sleep(10 * time.Microsecond)
+		return nil, false
+	}
+
+	t.ResetTimer()
+
+	for n := 0; n < t.N; n++ {
+		err := c.sync()
+		require.NoError(t, err)
+	}
+}
+
 func TestEnsureSynced(t *testing.T) {
 	obj1 := &appsv1.Deployment{
 		TypeMeta: metav1.TypeMeta{
@@ -194,7 +237,7 @@ func TestStatefulSetOwnershipInferred(t *testing.T) {
 		TypeMeta:   metav1.TypeMeta{APIVersion: "apps/v1", Kind: kube.StatefulSetKind},
 		ObjectMeta: metav1.ObjectMeta{UID: "123", Name: "web", Namespace: "default"},
 		Spec: appsv1.StatefulSetSpec{
-			VolumeClaimTemplates: []v1.PersistentVolumeClaim{{
+			VolumeClaimTemplates: []corev1.PersistentVolumeClaim{{
 				ObjectMeta: metav1.ObjectMeta{
 					Name: "www",
 				},
@@ -205,14 +248,14 @@ func TestStatefulSetOwnershipInferred(t *testing.T) {
 	tests := []struct {
 		name          string
 		cluster       *clusterCache
-		pvc           *v1.PersistentVolumeClaim
+		pvc           *corev1.PersistentVolumeClaim
 		expectedRefs  []metav1.OwnerReference
 		expectNoOwner bool
 	}{
 		{
 			name:    "STSTemplateNameNotMatching",
 			cluster: newCluster(t, sts),
-			pvc: &v1.PersistentVolumeClaim{
+			pvc: &corev1.PersistentVolumeClaim{
 				TypeMeta:   metav1.TypeMeta{Kind: kube.PersistentVolumeClaimKind},
 				ObjectMeta: metav1.ObjectMeta{Name: "www1-web-0", Namespace: "default"},
 			},
@@ -221,7 +264,7 @@ func TestStatefulSetOwnershipInferred(t *testing.T) {
 		{
 			name:    "MatchingSTSExists",
 			cluster: newCluster(t, sts),
-			pvc: &v1.PersistentVolumeClaim{
+			pvc: &corev1.PersistentVolumeClaim{
 				TypeMeta:   metav1.TypeMeta{Kind: kube.PersistentVolumeClaimKind},
 				ObjectMeta: metav1.ObjectMeta{Name: "www-web-0", Namespace: "default"},
 			},
@@ -230,7 +273,7 @@ func TestStatefulSetOwnershipInferred(t *testing.T) {
 		{
 			name:    "STSTemplateNameNotMatchingWithBatchProcessing",
 			cluster: newClusterWithOptions(t, opts, sts),
-			pvc: &v1.PersistentVolumeClaim{
+			pvc: &corev1.PersistentVolumeClaim{
 				TypeMeta:   metav1.TypeMeta{Kind: kube.PersistentVolumeClaimKind},
 				ObjectMeta: metav1.ObjectMeta{Name: "www1-web-0", Namespace: "default"},
 			},
@@ -239,7 +282,7 @@ func TestStatefulSetOwnershipInferred(t *testing.T) {
 		{
 			name:    "MatchingSTSExistsWithBatchProcessing",
 			cluster: newClusterWithOptions(t, opts, sts),
-			pvc: &v1.PersistentVolumeClaim{
+			pvc: &corev1.PersistentVolumeClaim{
 				TypeMeta:   metav1.TypeMeta{Kind: kube.PersistentVolumeClaimKind},
 				ObjectMeta: metav1.ObjectMeta{Name: "www-web-0", Namespace: "default"},
 			},
@@ -352,7 +395,7 @@ func TestGetChildren(t *testing.T) {
 
 func TestGetManagedLiveObjs(t *testing.T) {
 	cluster := newCluster(t, testPod1(), testRS(), testDeploy())
-	cluster.Invalidate(SetPopulateResourceInfoHandler(func(un *unstructured.Unstructured, isRoot bool) (info interface{}, cacheManifest bool) {
+	cluster.Invalidate(SetPopulateResourceInfoHandler(func(_ *unstructured.Unstructured, _ bool) (info any, cacheManifest bool) {
 		return nil, true
 	}))
 
@@ -371,14 +414,14 @@ metadata:
 		return len(r.OwnerRefs) == 0
 	})
 	require.NoError(t, err)
-	assert.Equal(t, managedObjs, map[kube.ResourceKey]*unstructured.Unstructured{
+	assert.Equal(t, map[kube.ResourceKey]*unstructured.Unstructured{
 		kube.NewResourceKey("apps", "Deployment", "default", "helm-guestbook"): mustToUnstructured(testDeploy()),
-	})
+	}, managedObjs)
 }
 
 func TestGetManagedLiveObjsNamespacedModeClusterLevelResource(t *testing.T) {
 	cluster := newCluster(t, testPod1(), testRS(), testDeploy())
-	cluster.Invalidate(SetPopulateResourceInfoHandler(func(un *unstructured.Unstructured, isRoot bool) (info interface{}, cacheManifest bool) {
+	cluster.Invalidate(SetPopulateResourceInfoHandler(func(_ *unstructured.Unstructured, _ bool) (info any, cacheManifest bool) {
 		return nil, true
 	}))
 	cluster.namespaces = []string{"default", "production"}
@@ -403,7 +446,7 @@ metadata:
 
 func TestGetManagedLiveObjsNamespacedModeClusterLevelResource_ClusterResourceEnabled(t *testing.T) {
 	cluster := newCluster(t, testPod1(), testRS(), testDeploy())
-	cluster.Invalidate(SetPopulateResourceInfoHandler(func(un *unstructured.Unstructured, isRoot bool) (info interface{}, cacheManifest bool) {
+	cluster.Invalidate(SetPopulateResourceInfoHandler(func(_ *unstructured.Unstructured, _ bool) (info any, cacheManifest bool) {
 		return nil, true
 	}))
 	cluster.namespaces = []string{"default", "production"}
@@ -424,7 +467,7 @@ metadata:
 	_, err = cluster.GetManagedLiveObjs([]*unstructured.Unstructured{clusterLevelRes}, func(r *Resource) bool {
 		return len(r.OwnerRefs) == 0
 	})
-	assert.Nil(t, err)
+	require.NoError(t, err)
 
 	otherNamespaceRes := strToUnstructured(`
 apiVersion: apps/v1
@@ -444,7 +487,7 @@ metadata:
 
 func TestGetManagedLiveObjsAllNamespaces(t *testing.T) {
 	cluster := newCluster(t, testPod1(), testRS(), testDeploy())
-	cluster.Invalidate(SetPopulateResourceInfoHandler(func(un *unstructured.Unstructured, isRoot bool) (info interface{}, cacheManifest bool) {
+	cluster.Invalidate(SetPopulateResourceInfoHandler(func(_ *unstructured.Unstructured, _ bool) (info any, cacheManifest bool) {
 		return nil, true
 	}))
 	cluster.namespaces = nil
@@ -465,14 +508,14 @@ metadata:
 		return len(r.OwnerRefs) == 0
 	})
 	require.NoError(t, err)
-	assert.Equal(t, managedObjs, map[kube.ResourceKey]*unstructured.Unstructured{
+	assert.Equal(t, map[kube.ResourceKey]*unstructured.Unstructured{
 		kube.NewResourceKey("apps", "Deployment", "default", "helm-guestbook"): mustToUnstructured(testDeploy()),
-	})
+	}, managedObjs)
 }
 
 func TestGetManagedLiveObjsValidNamespace(t *testing.T) {
 	cluster := newCluster(t, testPod1(), testRS(), testDeploy())
-	cluster.Invalidate(SetPopulateResourceInfoHandler(func(un *unstructured.Unstructured, isRoot bool) (info interface{}, cacheManifest bool) {
+	cluster.Invalidate(SetPopulateResourceInfoHandler(func(_ *unstructured.Unstructured, _ bool) (info any, cacheManifest bool) {
 		return nil, true
 	}))
 	cluster.namespaces = []string{"default", "production"}
@@ -493,14 +536,14 @@ metadata:
 		return len(r.OwnerRefs) == 0
 	})
 	require.NoError(t, err)
-	assert.Equal(t, managedObjs, map[kube.ResourceKey]*unstructured.Unstructured{
+	assert.Equal(t, map[kube.ResourceKey]*unstructured.Unstructured{
 		kube.NewResourceKey("apps", "Deployment", "default", "helm-guestbook"): mustToUnstructured(testDeploy()),
-	})
+	}, managedObjs)
 }
 
 func TestGetManagedLiveObjsInvalidNamespace(t *testing.T) {
 	cluster := newCluster(t, testPod1(), testRS(), testDeploy())
-	cluster.Invalidate(SetPopulateResourceInfoHandler(func(un *unstructured.Unstructured, isRoot bool) (info interface{}, cacheManifest bool) {
+	cluster.Invalidate(SetPopulateResourceInfoHandler(func(_ *unstructured.Unstructured, _ bool) (info any, cacheManifest bool) {
 		return nil, true
 	}))
 	cluster.namespaces = []string{"default", "develop"}
@@ -560,7 +603,7 @@ func TestGetManagedLiveObjsFailedConversion(t *testing.T) {
 						Meta:                 metav1.APIResource{Namespaced: true},
 					},
 				})
-			cluster.Invalidate(SetPopulateResourceInfoHandler(func(un *unstructured.Unstructured, isRoot bool) (info interface{}, cacheManifest bool) {
+			cluster.Invalidate(SetPopulateResourceInfoHandler(func(_ *unstructured.Unstructured, _ bool) (info any, cacheManifest bool) {
 				return nil, true
 			}))
 			cluster.namespaces = []string{"default"}
@@ -575,14 +618,14 @@ metadata:
   name: test-crontab
   namespace: default`)
 
-			var convertToVersionWasCalled = false
-			var getResourceWasCalled = false
+			convertToVersionWasCalled := false
+			getResourceWasCalled := false
 			cluster.kubectl.(*kubetest.MockKubectlCmd).
 				WithConvertToVersionFunc(func(obj *unstructured.Unstructured, _ string, _ string) (*unstructured.Unstructured, error) {
 					convertToVersionWasCalled = true
 
 					if testCaseCopy.localConvertFails {
-						return nil, fmt.Errorf("failed to convert resource client-side")
+						return nil, errors.New("failed to convert resource client-side")
 					}
 
 					return obj, nil
@@ -592,15 +635,15 @@ metadata:
 					return testCronTab(), nil
 				})
 
-			managedObjs, err := cluster.GetManagedLiveObjs([]*unstructured.Unstructured{targetDeploy}, func(r *Resource) bool {
+			managedObjs, err := cluster.GetManagedLiveObjs([]*unstructured.Unstructured{targetDeploy}, func(_ *Resource) bool {
 				return true
 			})
-			assert.NoError(t, err)
+			require.NoError(t, err)
 			assert.Equal(t, testCaseCopy.expectConvertToVersionCalled, convertToVersionWasCalled)
 			assert.Equal(t, testCaseCopy.expectGetResourceCalled, getResourceWasCalled)
-			assert.Equal(t, managedObjs, map[kube.ResourceKey]*unstructured.Unstructured{
+			assert.Equal(t, map[kube.ResourceKey]*unstructured.Unstructured{
 				kube.NewResourceKey(cronTabGroup, "CronTab", "default", "test-crontab"): mustToUnstructured(testCronTab()),
-			})
+			}, managedObjs)
 		})
 	}
 }
@@ -804,11 +847,12 @@ func ExampleNewClusterCache_resourceUpdatedEvents() {
 		panic(err)
 	}
 	unsubscribe := clusterCache.OnResourceUpdated(func(newRes *Resource, oldRes *Resource, _ map[kube.ResourceKey]*Resource) {
-		if newRes == nil {
+		switch {
+		case newRes == nil:
 			fmt.Printf("%s deleted\n", oldRes.Ref.String())
-		} else if oldRes == nil {
+		case oldRes == nil:
 			fmt.Printf("%s created\n", newRes.Ref.String())
-		} else {
+		default:
 			fmt.Printf("%s updated\n", newRes.Ref.String())
 		}
 	})
@@ -818,6 +862,7 @@ func ExampleNewClusterCache_resourceUpdatedEvents() {
 }
 
 func getResourceKey(t *testing.T, obj runtime.Object) kube.ResourceKey {
+	t.Helper()
 	gvk := obj.GetObjectKind().GroupVersionKind()
 	m, err := meta.Accessor(obj)
 	require.NoError(t, err)
@@ -911,14 +956,14 @@ func testCRD() *apiextensions.CustomResourceDefinition {
 }
 
 func testCronTab() *unstructured.Unstructured {
-	return &unstructured.Unstructured{Object: map[string]interface{}{
+	return &unstructured.Unstructured{Object: map[string]any{
 		"apiVersion": "stable.example.com/v1",
 		"kind":       "CronTab",
-		"metadata": map[string]interface{}{
+		"metadata": map[string]any{
 			"name":      "test-crontab",
 			"namespace": "default",
 		},
-		"spec": map[string]interface{}{
+		"spec": map[string]any{
 			"cronSpec": "* * * * */5",
 			"image":    "my-awesome-cron-image",
 		},
@@ -1017,7 +1062,8 @@ func TestIterateHierachy(t *testing.T) {
 				kube.GetResourceKey(mustToUnstructured(testPod1())),
 				kube.GetResourceKey(mustToUnstructured(testPod2())),
 				kube.GetResourceKey(mustToUnstructured(testRS())),
-				kube.GetResourceKey(mustToUnstructured(testDeploy()))},
+				kube.GetResourceKey(mustToUnstructured(testDeploy())),
+			},
 			keys)
 	})
 
@@ -1030,7 +1076,8 @@ func TestIterateHierachy(t *testing.T) {
 
 		assert.ElementsMatch(t,
 			[]kube.ResourceKey{
-				kube.GetResourceKey(mustToUnstructured(testDeploy()))},
+				kube.GetResourceKey(mustToUnstructured(testDeploy())),
+			},
 			keys)
 	})
 
@@ -1078,7 +1125,8 @@ func TestIterateHierachy(t *testing.T) {
 			[]kube.ResourceKey{
 				kube.GetResourceKey(mustToUnstructured(testPod1())),
 				kube.GetResourceKey(mustToUnstructured(testPod2())),
-				kube.GetResourceKey(mustToUnstructured(testExtensionsRS()))},
+				kube.GetResourceKey(mustToUnstructured(testExtensionsRS())),
+			},
 			keys)
 	})
 }
@@ -1101,7 +1149,8 @@ func TestIterateHierachyV2(t *testing.T) {
 				kube.GetResourceKey(mustToUnstructured(testPod1())),
 				kube.GetResourceKey(mustToUnstructured(testPod2())),
 				kube.GetResourceKey(mustToUnstructured(testRS())),
-				kube.GetResourceKey(mustToUnstructured(testDeploy()))},
+				kube.GetResourceKey(mustToUnstructured(testDeploy())),
+			},
 			keys)
 	})
 
@@ -1115,7 +1164,8 @@ func TestIterateHierachyV2(t *testing.T) {
 
 		assert.ElementsMatch(t,
 			[]kube.ResourceKey{
-				kube.GetResourceKey(mustToUnstructured(testDeploy()))},
+				kube.GetResourceKey(mustToUnstructured(testDeploy())),
+			},
 			keys)
 	})
 
@@ -1169,7 +1219,8 @@ func TestIterateHierachyV2(t *testing.T) {
 				kube.GetResourceKey(mustToUnstructured(testPod1())),
 				kube.GetResourceKey(mustToUnstructured(testPod2())),
 				kube.GetResourceKey(mustToUnstructured(testRS())),
-				kube.GetResourceKey(mustToUnstructured(testDeploy()))},
+				kube.GetResourceKey(mustToUnstructured(testDeploy())),
+			},
 			keys)
 	})
 
@@ -1186,7 +1237,8 @@ func TestIterateHierachyV2(t *testing.T) {
 			[]kube.ResourceKey{
 				kube.GetResourceKey(mustToUnstructured(testPod1())),
 				kube.GetResourceKey(mustToUnstructured(testPod2())),
-				kube.GetResourceKey(mustToUnstructured(testExtensionsRS()))},
+				kube.GetResourceKey(mustToUnstructured(testExtensionsRS())),
+			},
 			keys)
 	})
 }
@@ -1209,7 +1261,7 @@ func Test_watchEvents_Deadlock(t *testing.T) {
 		// Resync watches often to use the semaphore and trigger the rate limiting behavior
 		SetResyncTimeout(500 * time.Millisecond),
 		// Use new resource handler to run code in the list callbacks
-		SetPopulateResourceInfoHandler(func(un *unstructured.Unstructured, isRoot bool) (info interface{}, cacheManifest bool) {
+		SetPopulateResourceInfoHandler(func(un *unstructured.Unstructured, _ bool) (info any, cacheManifest bool) {
 			if un.GroupVersionKind().GroupKind() == res1.GroupVersionKind().GroupKind() ||
 				un.GroupVersionKind().GroupKind() == res2.GroupVersionKind().GroupKind() {
 				// Create a bottleneck for resources holding the semaphore
@@ -1258,7 +1310,7 @@ func Test_watchEvents_Deadlock(t *testing.T) {
 			require.True(t, v)
 		case <-time.After(10 * time.Second):
 			hasDeadlock = true
-			t.Errorf("timeout reached on attempt %d. It is possible that a deadlock occured", i)
+			t.Errorf("timeout reached on attempt %d. It is possible that a deadlock occurred", i)
 			// Tip: to debug the deadlock, increase the timer to a value higher than X in "go test -timeout X"
 			// This will make the test panic with the goroutines information
 			t.FailNow()
@@ -1321,13 +1373,13 @@ func BenchmarkIterateHierarchyV2(b *testing.B) {
 	for n := 0; n < b.N; n++ {
 		cluster.IterateHierarchyV2([]kube.ResourceKey{
 			{Namespace: "default", Name: "test-1", Kind: "Pod"},
-		}, func(child *Resource, _ map[kube.ResourceKey]*Resource) bool {
+		}, func(_ *Resource, _ map[kube.ResourceKey]*Resource) bool {
 			return true
 		})
 	}
 }
 
-//func BenchmarkIterateHierarchy(b *testing.B) {
+// func BenchmarkIterateHierarchy(b *testing.B) {
 //	cluster := newCluster(b)
 //	for _, resource := range testResources {
 //		cluster.setNode(resource)
