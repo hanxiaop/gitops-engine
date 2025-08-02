@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"runtime/debug"
-	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -130,9 +129,6 @@ type ClusterCache interface {
 	Invalidate(opts ...UpdateSettingsFunc)
 	// FindResources returns resources that matches given list of predicates from specified namespace or everywhere if specified namespace is empty
 	FindResources(namespace string, predicates ...func(r *Resource) bool) map[kube.ResourceKey]*Resource
-	// IterateHierarchy iterates resource tree starting from the specified top level resource and executes callback for each resource in the tree.
-	// The action callback returns true if iteration should continue and false otherwise.
-	IterateHierarchy(key kube.ResourceKey, action func(resource *Resource, namespaceResources map[kube.ResourceKey]*Resource) bool)
 	// IterateHierarchyV2 iterates resource tree starting from the specified top level resources and executes callback for each resource in the tree.
 	// The action callback returns true if iteration should continue and false otherwise.
 	IterateHierarchyV2(keys []kube.ResourceKey, action func(resource *Resource, namespaceResources map[kube.ResourceKey]*Resource) bool)
@@ -537,15 +533,15 @@ func (c *clusterCache) stopWatching(gk schema.GroupKind, ns string) {
 func (c *clusterCache) startMissingWatches() error {
 	apis, err := c.kubectl.GetAPIResources(c.config, true, c.settings.ResourcesFilter)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to get APIResources: %w", err)
 	}
 	client, err := c.kubectl.NewDynamicClient(c.config)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to create client: %w", err)
 	}
 	clientset, err := kubernetes.NewForConfig(c.config)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to create clientset: %w", err)
 	}
 	namespacedResources := make(map[schema.GroupKind]bool)
 	for i := range apis {
@@ -595,7 +591,7 @@ func runSynced(lock sync.Locker, action func() error) error {
 // The callback should not wait on any locks that may be held by other callers.
 func (c *clusterCache) listResources(ctx context.Context, resClient dynamic.ResourceInterface, callback func(*pager.ListPager) error) (string, error) {
 	if err := c.listSemaphore.Acquire(ctx, 1); err != nil {
-		return "", err
+		return "", fmt.Errorf("failed to acquire list semaphore: %w", err)
 	}
 	defer c.listSemaphore.Release(1)
 
@@ -621,12 +617,16 @@ func (c *clusterCache) listResources(ctx context.Context, resClient dynamic.Reso
 					retryCount++
 					c.log.Info(fmt.Sprintf("Error while listing resources: %v (try %d/%d)", ierr, retryCount, c.listRetryLimit))
 				}
+				//nolint:wrapcheck // wrap outside the retry
 				return ierr
 			}
 			resourceVersion = res.GetResourceVersion()
 			return nil
 		})
-		return res, err
+		if err != nil {
+			return res, fmt.Errorf("failed to list resources: %w", err)
+		}
+		return res, nil
 	})
 	listPager.PageBufferSize = c.listPageBufferSize
 	listPager.PageSize = c.listPageSize
@@ -665,7 +665,7 @@ func (c *clusterCache) watchEvents(ctx context.Context, api kube.APIResourceInfo
 	kube.RetryUntilSucceed(ctx, watchResourcesRetryTimeout, fmt.Sprintf("watch %s on %s", api.GroupKind, c.config.Host), c.log, func() (err error) {
 		defer func() {
 			if r := recover(); r != nil {
-				err = fmt.Errorf("Recovered from panic: %+v\n%s", r, debug.Stack())
+				err = fmt.Errorf("recovered from panic: %+v\n%s", r, debug.Stack())
 			}
 		}()
 
@@ -677,17 +677,18 @@ func (c *clusterCache) watchEvents(ctx context.Context, api kube.APIResourceInfo
 			}
 		}
 
-		w, err := watchutil.NewRetryWatcher(resourceVersion, &cache.ListWatch{
+		w, err := watchutil.NewRetryWatcherWithContext(ctx, resourceVersion, &cache.ListWatch{
 			WatchFunc: func(options metav1.ListOptions) (watch.Interface, error) {
 				res, err := resClient.Watch(ctx, options)
 				if apierrors.IsNotFound(err) {
 					c.stopWatching(api.GroupKind, ns)
 				}
+				//nolint:wrapcheck // wrap outside the retry
 				return res, err
 			},
 		})
 		if err != nil {
-			return err
+			return fmt.Errorf("failed to create resource watcher: %w", err)
 		}
 
 		defer func() {
@@ -710,20 +711,20 @@ func (c *clusterCache) watchEvents(ctx context.Context, api kube.APIResourceInfo
 
 			// re-synchronize API state and restart watch periodically
 			case <-watchResyncTimeoutCh:
-				return fmt.Errorf("Resyncing %s on %s due to timeout", api.GroupKind, c.config.Host)
+				return fmt.Errorf("resyncing %s on %s due to timeout", api.GroupKind, c.config.Host)
 
 			// re-synchronize API state and restart watch if retry watcher failed to continue watching using provided resource version
 			case <-w.Done():
-				return fmt.Errorf("Watch %s on %s has closed", api.GroupKind, c.config.Host)
+				return fmt.Errorf("watch %s on %s has closed", api.GroupKind, c.config.Host)
 
 			case event, ok := <-w.ResultChan():
 				if !ok {
-					return fmt.Errorf("Watch %s on %s has closed", api.GroupKind, c.config.Host)
+					return fmt.Errorf("watch %s on %s has closed", api.GroupKind, c.config.Host)
 				}
 
 				obj, ok := event.Object.(*unstructured.Unstructured)
 				if !ok {
-					return fmt.Errorf("Failed to convert to *unstructured.Unstructured: %v", event.Object)
+					return fmt.Errorf("failed to convert to *unstructured.Unstructured: %v", event.Object)
 				}
 
 				c.recordEvent(event.Type, obj)
@@ -841,7 +842,7 @@ func (c *clusterCache) checkPermission(ctx context.Context, reviewInterface auth
 	case len(c.namespaces) == 0 || (!api.Meta.Namespaced && c.clusterResources):
 		resp, err := reviewInterface.Create(ctx, sar, metav1.CreateOptions{})
 		if err != nil {
-			return false, err
+			return false, fmt.Errorf("failed to create self subject access review: %w", err)
 		}
 		if resp != nil && resp.Status.Allowed {
 			return true, nil
@@ -854,7 +855,7 @@ func (c *clusterCache) checkPermission(ctx context.Context, reviewInterface auth
 			sar.Spec.ResourceAttributes.Namespace = ns
 			resp, err := reviewInterface.Create(ctx, sar, metav1.CreateOptions{})
 			if err != nil {
-				return false, err
+				return false, fmt.Errorf("failed to create self subject access review: %w", err)
 			}
 			if resp != nil && resp.Status.Allowed {
 				return true, nil
@@ -898,12 +899,12 @@ func (c *clusterCache) sync() error {
 	config := c.config
 	version, err := c.kubectl.GetServerVersion(config)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to get server version: %w", err)
 	}
 	c.serverVersion = version
 	apiResources, err := c.kubectl.GetAPIResources(config, false, NewNoopSettings())
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to get api resources: %w", err)
 	}
 	c.apiResources = apiResources
 
@@ -920,15 +921,15 @@ func (c *clusterCache) sync() error {
 
 	apis, err := c.kubectl.GetAPIResources(c.config, true, c.settings.ResourcesFilter)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to get api resources: %w", err)
 	}
 	client, err := c.kubectl.NewDynamicClient(c.config)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to create client: %w", err)
 	}
 	clientset, err := kubernetes.NewForConfig(config)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to create clientset: %w", err)
 	}
 
 	if c.batchEventsProcessing {
@@ -1065,46 +1066,6 @@ func (c *clusterCache) FindResources(namespace string, predicates ...func(r *Res
 	return result
 }
 
-// IterateHierarchy iterates resource tree starting from the specified top level resource and executes callback for each resource in the tree
-func (c *clusterCache) IterateHierarchy(key kube.ResourceKey, action func(resource *Resource, namespaceResources map[kube.ResourceKey]*Resource) bool) {
-	c.lock.RLock()
-	defer c.lock.RUnlock()
-	if res, ok := c.resources[key]; ok {
-		nsNodes := c.nsIndex[key.Namespace]
-		if !action(res, nsNodes) {
-			return
-		}
-		childrenByUID := make(map[types.UID][]*Resource)
-		for _, child := range nsNodes {
-			if res.isParentOf(child) {
-				childrenByUID[child.Ref.UID] = append(childrenByUID[child.Ref.UID], child)
-			}
-		}
-		// make sure children has no duplicates
-		for _, children := range childrenByUID {
-			if len(children) > 0 {
-				// The object might have multiple children with the same UID (e.g. replicaset from apps and extensions group). It is ok to pick any object but we need to make sure
-				// we pick the same child after every refresh.
-				sort.Slice(children, func(i, j int) bool {
-					key1 := children[i].ResourceKey()
-					key2 := children[j].ResourceKey()
-					return strings.Compare(key1.String(), key2.String()) < 0
-				})
-				child := children[0]
-				if action(child, nsNodes) {
-					child.iterateChildren(nsNodes, map[kube.ResourceKey]bool{res.ResourceKey(): true}, func(err error, child *Resource, namespaceResources map[kube.ResourceKey]*Resource) bool {
-						if err != nil {
-							c.log.V(2).Info(err.Error())
-							return false
-						}
-						return action(child, namespaceResources)
-					})
-				}
-			}
-		}
-	}
-}
-
 // IterateHierarchy iterates resource tree starting from the specified top level resources and executes callback for each resource in the tree
 func (c *clusterCache) IterateHierarchyV2(keys []kube.ResourceKey, action func(resource *Resource, namespaceResources map[kube.ResourceKey]*Resource) bool) {
 	c.lock.RLock()
@@ -1232,9 +1193,9 @@ func (c *clusterCache) GetManagedLiveObjs(targetObjs []*unstructured.Unstructure
 	for _, o := range targetObjs {
 		if len(c.namespaces) > 0 {
 			if o.GetNamespace() == "" && !c.clusterResources {
-				return nil, fmt.Errorf("Cluster level %s %q can not be managed when in namespaced mode", o.GetKind(), o.GetName())
+				return nil, fmt.Errorf("cluster level %s %q can not be managed when in namespaced mode", o.GetKind(), o.GetName())
 			} else if o.GetNamespace() != "" && !c.managesNamespace(o.GetNamespace()) {
-				return nil, fmt.Errorf("Namespace %q for %s %q is not managed", o.GetNamespace(), o.GetKind(), o.GetName())
+				return nil, fmt.Errorf("namespace %q for %s %q is not managed", o.GetNamespace(), o.GetKind(), o.GetName())
 			}
 		}
 	}
@@ -1266,7 +1227,7 @@ func (c *clusterCache) GetManagedLiveObjs(targetObjs []*unstructured.Unstructure
 						if apierrors.IsNotFound(err) {
 							return nil
 						}
-						return err
+						return fmt.Errorf("unexpected error getting managed object: %w", err)
 					}
 				}
 			} else if _, watched := c.apisMeta[key.GroupKind()]; !watched {
@@ -1276,7 +1237,7 @@ func (c *clusterCache) GetManagedLiveObjs(targetObjs []*unstructured.Unstructure
 					if apierrors.IsNotFound(err) {
 						return nil
 					}
-					return err
+					return fmt.Errorf("unexpected error getting managed object: %w", err)
 				}
 			}
 		}
@@ -1291,7 +1252,7 @@ func (c *clusterCache) GetManagedLiveObjs(targetObjs []*unstructured.Unstructure
 					if apierrors.IsNotFound(err) {
 						return nil
 					}
-					return err
+					return fmt.Errorf("unexpected error getting managed object: %w", err)
 				}
 			} else {
 				managedObj = converted
@@ -1303,7 +1264,7 @@ func (c *clusterCache) GetManagedLiveObjs(targetObjs []*unstructured.Unstructure
 		return nil
 	})
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to get managed objects: %w", err)
 	}
 
 	return managedObjs, nil

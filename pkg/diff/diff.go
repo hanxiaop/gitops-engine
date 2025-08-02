@@ -74,14 +74,20 @@ func GetNoopNormalizer() Normalizer {
 // Diff performs a diff on two unstructured objects. If the live object happens to have a
 // "kubectl.kubernetes.io/last-applied-configuration", then perform a three way diff.
 func Diff(config, live *unstructured.Unstructured, opts ...Option) (*DiffResult, error) {
+	preDiffOpts := opts
 	o := applyOptions(opts)
+	// If server-side diff is enabled, we need to skip full normalization (including ignore differences)
+	// when pre-processing the config and live objects.
+	if o.serverSideDiff {
+		preDiffOpts = append(preDiffOpts, WithSkipFullNormalize(true))
+	}
 	if config != nil {
 		config = remarshal(config, o)
-		Normalize(config, opts...)
+		Normalize(config, preDiffOpts...)
 	}
 	if live != nil {
 		live = remarshal(live, o)
-		Normalize(live, opts...)
+		Normalize(live, preDiffOpts...)
 	}
 
 	if o.serverSideDiff {
@@ -185,6 +191,7 @@ func serverSideDiff(config, live *unstructured.Unstructured, opts ...Option) (*D
 		return nil, fmt.Errorf("error marshaling predicted live for resource %s/%s: %w", config.GetKind(), config.GetName(), err)
 	}
 
+	Normalize(live, opts...)
 	unstructured.RemoveNestedField(live.Object, "metadata", "managedFields")
 	liveBytes, err := json.Marshal(live)
 	if err != nil {
@@ -248,12 +255,28 @@ func removeWebhookMutation(predictedLive, live *unstructured.Unstructured, gvkPa
 	// Remove fields from predicted live that are not managed by the provided manager
 	nonArgoFieldsSet := predictedLiveFieldSet.Difference(managerFieldsSet)
 
+	// Compare the predicted live with the live resource
+	comparison, err := typedLive.Compare(typedPredictedLive)
+	if err != nil {
+		return nil, fmt.Errorf("error comparing predicted resource to live resource: %w", err)
+	}
+
+	if comparison.Removed != nil && !comparison.Removed.Empty() {
+		// exclude the removed fields not owned by this manager from the comparison
+		comparison.Removed = comparison.Removed.Difference(nonArgoFieldsSet)
+	}
+
 	// In case any of the removed fields cause schema violations, we will keep those fields
 	nonArgoFieldsSet = safelyRemoveFieldsSet(typedPredictedLive, nonArgoFieldsSet)
 	typedPredictedLive = typedPredictedLive.RemoveItems(nonArgoFieldsSet)
 
 	// Apply the predicted live state to the live state to get a diff without mutation webhook fields
 	typedPredictedLive, err = typedLive.Merge(typedPredictedLive)
+
+	// After applying the predicted live to live state, this would cause any removed fields to be restored.
+	// We need to re-remove these from predicted live.
+	typedPredictedLive = typedPredictedLive.RemoveItems(comparison.Removed)
+
 	if err != nil {
 		return nil, fmt.Errorf("error applying predicted live to live state: %w", err)
 	}
@@ -405,7 +428,7 @@ func apply(tvConfig, tvLive *typed.TypedValue, p *SMDParams) (*typed.TypedValue,
 	if err != nil {
 		return nil, fmt.Errorf("error while running updater.Apply: %w", err)
 	}
-	return mergedLive, err
+	return mergedLive, nil
 }
 
 func buildManagerInfoForApply(manager string) (string, error) {
@@ -413,6 +436,7 @@ func buildManagerInfoForApply(manager string) (string, error) {
 		Manager:   manager,
 		Operation: metav1.ManagedFieldsOperationApply,
 	}
+	//nolint:wrapcheck // trivial function, wrapped nicely by the caller
 	return fieldmanager.BuildManagerIdentifier(&managerInfo)
 }
 
@@ -473,13 +497,13 @@ func handleResourceCreateOrDeleteDiff(config, live *unstructured.Unstructured) (
 	if live != nil {
 		liveData, err := json.Marshal(live)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("error marshaling live resource: %w", err)
 		}
 		return &DiffResult{Modified: false, NormalizedLive: liveData, PredictedLive: []byte("null")}, nil
 	} else if config != nil {
 		predictedLiveData, err := json.Marshal(config.Object)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("error marshaling config resource: %w", err)
 		}
 		return &DiffResult{Modified: true, NormalizedLive: []byte("null"), PredictedLive: predictedLiveData}, nil
 	}
@@ -523,7 +547,7 @@ func applyPatch(liveBytes []byte, patchBytes []byte, newVersionedObject func() (
 	// Apply the patchBytes patch against liveBytes, using predictedLive to indicate the k8s data type
 	predictedLiveBytes, err := strategicpatch.StrategicMergePatch(liveBytes, patchBytes, predictedLive)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, fmt.Errorf("failed to construct strategic merge patch: %w", err)
 	}
 
 	// Unmarshal predictedLiveBytes into predictedLive; note that this will discard JSON fields in predictedLiveBytes
@@ -546,7 +570,7 @@ func applyPatch(liveBytes []byte, patchBytes []byte, newVersionedObject func() (
 		// to its k8s resource type (eg the JSON may contain those invalid fields that we do not wish to discard).
 		predictedLiveBytes, err = strategicpatch.StrategicMergePatch(predictedLiveBytes, patch, predictedLive.DeepCopyObject())
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, fmt.Errorf("failed to construct strategic merge patch for predicted state: %w", err)
 		}
 
 		// 3) Unmarshall into a map[string]any, then back into byte[], to ensure the fields
@@ -555,11 +579,11 @@ func applyPatch(liveBytes []byte, patchBytes []byte, newVersionedObject func() (
 		var result map[string]any
 		err = json.Unmarshal([]byte(predictedLiveBytes), &result)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, fmt.Errorf("failed to unmarshal strategic merge patch for predicted state: %w", err)
 		}
 		predictedLiveBytes, err = json.Marshal(result)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, fmt.Errorf("failed to marshal strategic merge patch for predicted state: %w", err)
 		}
 	}
 
@@ -579,18 +603,18 @@ func applyPatch(liveBytes []byte, patchBytes []byte, newVersionedObject func() (
 		}
 		liveBytes, err = strategicpatch.StrategicMergePatch(liveBytes, patch, live.DeepCopyObject())
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, fmt.Errorf("failed to construct strategic merge patch for live state: %w", err)
 		}
 
 		// Ensure the fields are sorted in a consistent order (as above)
 		var result map[string]any
 		err = json.Unmarshal([]byte(liveBytes), &result)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, fmt.Errorf("failed to unmarshal strategic merge patch for live state: %w", err)
 		}
 		liveBytes, err = json.Marshal(result)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, fmt.Errorf("failed to marshal strategic merge patch for live state: %w", err)
 		}
 	}
 
@@ -646,7 +670,7 @@ func ThreeWayDiff(orig, config, live *unstructured.Unstructured) (*DiffResult, e
 	// 2. get expected live object by applying the patch against the live object
 	liveBytes, err := json.Marshal(live)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to marshal live state: %w", err)
 	}
 
 	var predictedLiveBytes []byte
@@ -661,7 +685,7 @@ func ThreeWayDiff(orig, config, live *unstructured.Unstructured) (*DiffResult, e
 		// Otherwise, merge patch directly as JSON
 		predictedLiveBytes, err = jsonpatch.MergePatch(liveBytes, patchBytes)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("failed to construct merge patch for predicted state: %w", err)
 		}
 	}
 
@@ -717,11 +741,11 @@ func statefulSetWorkaround(orig, live *unstructured.Unstructured) *unstructured.
 func threeWayMergePatch(orig, config, live *unstructured.Unstructured) ([]byte, func() (runtime.Object, error), error) {
 	origBytes, err := json.Marshal(orig.Object)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, fmt.Errorf("failed to marshal original object: %w", err)
 	}
 	configBytes, err := json.Marshal(config.Object)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, fmt.Errorf("failed to marshal config object: %w", err)
 	}
 
 	if versionedObject, err := scheme.Scheme.New(orig.GroupVersionKind()); err == nil {
@@ -732,16 +756,16 @@ func threeWayMergePatch(orig, config, live *unstructured.Unstructured) ([]byte, 
 
 		liveBytes, err := json.Marshal(live.Object)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, fmt.Errorf("failed to marshal live object: %w", err)
 		}
 
 		lookupPatchMeta, err := strategicpatch.NewPatchMetaFromStruct(versionedObject)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, fmt.Errorf("failed to construct lookup patch: %w", err)
 		}
 		patch, err := strategicpatch.CreateThreeWayMergePatch(origBytes, configBytes, liveBytes, lookupPatchMeta, true)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, fmt.Errorf("failed to construct thre way merge patch: %w", err)
 		}
 		newVersionedObject := func() (runtime.Object, error) {
 			return scheme.Scheme.New(orig.GroupVersionKind())
@@ -754,12 +778,12 @@ func threeWayMergePatch(orig, config, live *unstructured.Unstructured) ([]byte, 
 
 	liveBytes, err := json.Marshal(live.Object)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, fmt.Errorf("failed to marshal live object: %w", err)
 	}
 
 	patch, err := jsonmergepatch.CreateThreeWayJSONMergePatch(origBytes, configBytes, liveBytes)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, fmt.Errorf("failed to construct thre way merge patch: %w", err)
 	}
 	return patch, nil, nil
 }
@@ -827,9 +851,14 @@ func Normalize(un *unstructured.Unstructured, opts ...Option) {
 		normalizeEndpoint(un, o)
 	}
 
-	err := o.normalizer.Normalize(un)
-	if err != nil {
-		o.log.Error(err, fmt.Sprintf("Failed to normalize %s/%s/%s", un.GroupVersionKind(), un.GetNamespace(), un.GetName()))
+	// Skip the full normalization (ignoreDifferences + knownTypes) for server-side diff
+	// In the case an ignoreDifferences field is required, it needs to be present in the config
+	// before server-side diff is calculated and normalized before final comparison.
+	if !o.skipFullNormalize {
+		err := o.normalizer.Normalize(un)
+		if err != nil {
+			o.log.Error(err, fmt.Sprintf("Failed to normalize %s/%s/%s", un.GroupVersionKind(), un.GetNamespace(), un.GetName()))
+		}
 	}
 }
 
@@ -905,6 +934,7 @@ func normalizeEndpoint(un *unstructured.Unstructured, o options) {
 	if gvk.Group != "" || gvk.Kind != "Endpoints" {
 		return
 	}
+	//nolint:staticcheck // SA1019: corev1.Endpoints is deprecated in v1.33+, but we need to keep it for backward compatibility
 	var ep corev1.Endpoints
 	err := runtime.DefaultUnstructuredConverter.FromUnstructured(un.Object, &ep)
 	if err != nil {
@@ -973,15 +1003,15 @@ func normalizeRole(un *unstructured.Unstructured, o options) {
 func CreateTwoWayMergePatch(orig, new, dataStruct any) ([]byte, bool, error) {
 	origBytes, err := json.Marshal(orig)
 	if err != nil {
-		return nil, false, err
+		return nil, false, fmt.Errorf("failed to marshal orig object: %w", err)
 	}
 	newBytes, err := json.Marshal(new)
 	if err != nil {
-		return nil, false, err
+		return nil, false, fmt.Errorf("failed to marshal new object: %w", err)
 	}
 	patch, err := strategicpatch.CreateTwoWayMergePatch(origBytes, newBytes, dataStruct)
 	if err != nil {
-		return nil, false, err
+		return nil, false, fmt.Errorf("failed to create two way merge patch: %w", err)
 	}
 	return patch, string(patch) != "{}", nil
 }

@@ -34,11 +34,11 @@ import (
 func printDiff(result *DiffResult) (string, error) {
 	var live unstructured.Unstructured
 	if err := json.Unmarshal(result.NormalizedLive, &live); err != nil {
-		return "", err
+		return "", fmt.Errorf("failed to unmarshal live object: %w", err)
 	}
 	var target unstructured.Unstructured
 	if err := json.Unmarshal(result.PredictedLive, &target); err != nil {
-		return "", err
+		return "", fmt.Errorf("failed to unmarshal target object: %w", err)
 	}
 	out, _ := printDiffInternal("diff", &live, &target)
 	return string(out), nil
@@ -48,39 +48,45 @@ func printDiff(result *DiffResult) (string, error) {
 func printDiffInternal(name string, live *unstructured.Unstructured, target *unstructured.Unstructured) ([]byte, error) {
 	tempDir, err := os.MkdirTemp("", "argocd-diff")
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to create temp directory: %w", err)
 	}
 	targetFile := filepath.Join(tempDir, name)
 	var targetData []byte
 	if target != nil {
 		targetData, err = yaml.Marshal(target)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("failed to marshal target object: %w", err)
 		}
 	}
 	err = os.WriteFile(targetFile, targetData, 0o644)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to write target object: %w", err)
 	}
 	liveFile := filepath.Join(tempDir, name+"-live.yaml")
 	liveData := []byte("")
 	if live != nil {
 		liveData, err = yaml.Marshal(live)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("failed to marshal live object: %w", err)
 		}
 	}
 	err = os.WriteFile(liveFile, liveData, 0o644)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to write live object: %w", err)
 	}
 	cmd := exec.Command("diff", liveFile, targetFile)
-	return cmd.Output()
+	out, err := cmd.Output()
+	if err != nil {
+		// return output even if there's an error
+		return out, fmt.Errorf("failed to diff live object: %w", err)
+	}
+	return out, nil
 }
 
 func toUnstructured(obj any) (*unstructured.Unstructured, error) {
 	uObj, err := runtime.NewTestUnstructuredConverter(equality.Semantic).ToUnstructured(obj)
 	if err != nil {
+		//nolint:wrapcheck // don't wrap, trivial function
 		return nil, err
 	}
 	return &unstructured.Unstructured{Object: uObj}, nil
@@ -275,7 +281,7 @@ func TestDiffArrayModification(t *testing.T) {
 func TestThreeWayDiff(t *testing.T) {
 	// 1. get config and live to be the same. Both have a foo annotation.
 	configDep := newDeployment()
-	configDep.ObjectMeta.Namespace = ""
+	configDep.Namespace = ""
 	configDep.Annotations = map[string]string{
 		"foo": "bar",
 	}
@@ -540,7 +546,7 @@ func TestRemoveNamespaceAnnotation(t *testing.T) {
 			"namespace": "default",
 		},
 	}})
-	assert.Equal(t, "", obj.GetNamespace())
+	assert.Empty(t, obj.GetNamespace())
 
 	obj = removeNamespaceAnnotation(&unstructured.Unstructured{Object: map[string]any{
 		"metadata": map[string]any{
@@ -549,7 +555,7 @@ func TestRemoveNamespaceAnnotation(t *testing.T) {
 			"annotations": make(map[string]any),
 		},
 	}})
-	assert.Equal(t, "", obj.GetNamespace())
+	assert.Empty(t, obj.GetNamespace())
 	assert.Nil(t, obj.GetAnnotations())
 
 	obj = removeNamespaceAnnotation(&unstructured.Unstructured{Object: map[string]any{
@@ -559,7 +565,7 @@ func TestRemoveNamespaceAnnotation(t *testing.T) {
 			"annotations": "wrong value",
 		},
 	}})
-	assert.Equal(t, "", obj.GetNamespace())
+	assert.Empty(t, obj.GetNamespace())
 	val, _, _ := unstructured.NestedString(obj.Object, "metadata", "annotations")
 	assert.Equal(t, "wrong value", val)
 }
@@ -898,6 +904,11 @@ func TestServerSideDiff(t *testing.T) {
 		return opts
 	}
 
+	buildOptsWithNormalizer := func(predictedLive string, normalizer Normalizer) []Option {
+		opts := buildOpts(predictedLive)
+		return append(opts, WithNormalizer(normalizer))
+	}
+
 	t.Run("will ignore modifications done by mutation webhook by default", func(t *testing.T) {
 		// given
 		t.Parallel()
@@ -1030,6 +1041,86 @@ func TestServerSideDiff(t *testing.T) {
 		assert.Empty(t, predictedDeploy.Annotations[AnnotationLastAppliedConfig])
 		assert.Empty(t, liveDeploy.Annotations[AnnotationLastAppliedConfig])
 	})
+
+	t.Run("will reflect deletion of labels in predicted live", func(t *testing.T) {
+		// given
+		t.Parallel()
+		liveState := StrToUnstructured(testdata.ServiceLiveLabelYAMLSSD)
+		desiredState := StrToUnstructured(testdata.ServiceConfigNoLabelYAMLSSD)
+		opts := buildOpts(testdata.ServicePredictedLiveNoLabelJSONSSD)
+
+		// when
+		result, err := serverSideDiff(desiredState, liveState, opts...)
+
+		// then
+		require.NoError(t, err)
+		assert.NotNil(t, result)
+		assert.True(t, result.Modified)
+
+		predictedSvc := YamlToSvc(t, result.PredictedLive)
+		liveSvc := YamlToSvc(t, result.NormalizedLive)
+
+		// Ensure that the deleted label is not present in predicted and exists in live
+		_, predictedLabelExists := predictedSvc.Labels["delete-me"]
+		_, liveLabelExists := liveSvc.Labels["delete-me"]
+		assert.False(t, predictedLabelExists)
+		assert.True(t, liveLabelExists)
+	})
+
+	t.Run("will respect ignoreDifferences when full normalization is not skipped", func(t *testing.T) {
+		// given
+		t.Parallel()
+		liveState := StrToUnstructured(testdata.ServiceLiveYAMLSSD)
+		desiredState := StrToUnstructured(testdata.ServiceConfigYAMLSSD)
+
+		// Normalizer that ignores sessionAffinity (auto-assigned field that's commonly ignored)
+		normalizer := &testIgnoreDifferencesNormalizer{
+			fieldsToRemove: [][]string{
+				{"spec", "sessionAffinity"},
+			},
+		}
+
+		opts := buildOptsWithNormalizer(testdata.ServicePredictedLiveJSONSSD, normalizer)
+
+		// when
+		result, err := serverSideDiff(desiredState, liveState, opts...)
+
+		// then
+		require.NoError(t, err)
+		assert.NotNil(t, result)
+
+		// Should show diff for other fields but not the ignored sessionAffinity
+		assert.True(t, result.Modified, "Should show diff for non-ignored fields")
+
+		// Convert results to strings for verification
+		predictedLiveStr := string(result.PredictedLive)
+		normalizedLiveStr := string(result.NormalizedLive)
+
+		// Ports should appear in diff (not ignored)
+		assert.Contains(t, predictedLiveStr, "port", "Port differences should be visible")
+
+		// The ignored sessionAffinity should NOT appear in final result
+		assert.NotContains(t, predictedLiveStr, "sessionAffinity", "sessionAffinity should be removed by normalization")
+		assert.NotContains(t, normalizedLiveStr, "sessionAffinity", "sessionAffinity should be removed by normalization")
+
+		// Other fields should still be visible (not ignored)
+		assert.Contains(t, predictedLiveStr, "selector", "Other fields should remain visible")
+	})
+}
+
+// testIgnoreDifferencesNormalizer implements a simple normalizer that removes specified fields
+type testIgnoreDifferencesNormalizer struct {
+	fieldsToRemove [][]string
+}
+
+func (n *testIgnoreDifferencesNormalizer) Normalize(un *unstructured.Unstructured) error {
+	if un == nil {
+		return nil
+	}
+	for _, fieldPath := range n.fieldsToRemove {
+		unstructured.RemoveNestedField(un.Object, fieldPath...)
+	}
+	return nil
 }
 
 func createSecret(data map[string]string) *unstructured.Unstructured {
@@ -1581,4 +1672,139 @@ func StrToUnstructured(yamlStr string) *unstructured.Unstructured {
 		panic(err)
 	}
 	return &unstructured.Unstructured{Object: obj}
+}
+
+func TestDiffWithIgnoreDifferences(t *testing.T) {
+	t.Run("TwoWayDiff will respect ignoreDifferences for comparison but not output normalization", func(t *testing.T) {
+		// given
+		t.Parallel()
+
+		// Create a simple service with sessionAffinity that should be ignored
+		liveService := StrToUnstructured(`
+apiVersion: v1
+kind: Service
+metadata:
+  name: my-service
+spec:
+  selector:
+    app: my-app
+  ports:
+  - port: 80
+  sessionAffinity: None
+  type: ClusterIP
+`)
+
+		desiredService := StrToUnstructured(`
+apiVersion: v1
+kind: Service
+metadata:
+  name: my-service
+spec:
+  selector:
+    app: my-app
+  ports:
+  - port: 80
+  sessionAffinity: ClientIP
+  type: ClusterIP
+`)
+
+		// Normalizer that ignores sessionAffinity
+		normalizer := &testIgnoreDifferencesNormalizer{
+			fieldsToRemove: [][]string{
+				{"spec", "sessionAffinity"},
+			},
+		}
+
+		opts := []Option{
+			WithNormalizer(normalizer),
+			WithLogr(textlogger.NewLogger(textlogger.NewConfig())),
+		}
+
+		// when
+		result, err := Diff(desiredService, liveService, opts...)
+		require.NoError(t, err)
+
+		// then
+		assert.NotNil(t, result)
+
+		// Since sessionAffinity is ignored in input normalization, there should be no modification
+		assert.False(t, result.Modified, "Should not show diff for ignored fields")
+
+		predictedLiveStr := string(result.PredictedLive)
+		normalizedLiveStr := string(result.NormalizedLive)
+
+		// NOTE: Unlike server-side diff, TwoWayDiff/ThreeWayDiff don't normalize outputs
+		// So sessionAffinity WILL still appear in the output bytes, but Modified should be false
+		// because input normalization removed the differences during comparison
+		assert.Contains(t, predictedLiveStr, "sessionAffinity", "sessionAffinity should still appear in output (no output normalization)")
+		assert.Contains(t, normalizedLiveStr, "sessionAffinity", "sessionAffinity should still appear in output (no output normalization)")
+	})
+
+	t.Run("ThreeWayDiff will respect ignoreDifferences for comparison but not output normalization", func(t *testing.T) {
+		// given
+		t.Parallel()
+
+		// Create config and live with sessionAffinity differences that should be ignored
+		configService := StrToUnstructured(`
+apiVersion: v1
+kind: Service
+metadata:
+  name: my-service
+spec:
+  selector:
+    app: my-app
+  ports:
+  - port: 80
+  sessionAffinity: ClientIP
+  type: ClusterIP
+`)
+
+		liveService := StrToUnstructured(`
+apiVersion: v1
+kind: Service
+metadata:
+  name: my-service
+  annotations:
+    kubectl.kubernetes.io/last-applied-configuration: |
+      {"apiVersion":"v1","kind":"Service","metadata":{"name":"my-service"},"spec":{"selector":{"app":"my-app"},"ports":[{"port":80}],"sessionAffinity":"None","type":"ClusterIP"}}
+spec:
+  selector:
+    app: my-app
+  ports:
+  - port: 80
+  sessionAffinity: None
+  type: ClusterIP
+`)
+
+		// Normalizer that ignores sessionAffinity
+		normalizer := &testIgnoreDifferencesNormalizer{
+			fieldsToRemove: [][]string{
+				{"spec", "sessionAffinity"},
+			},
+		}
+
+		opts := []Option{
+			WithNormalizer(normalizer),
+			WithLogr(textlogger.NewLogger(textlogger.NewConfig())),
+		}
+
+		// when
+		result, err := Diff(configService, liveService, opts...)
+		require.NoError(t, err)
+
+		// then
+		assert.NotNil(t, result)
+
+		// Since sessionAffinity is ignored in input normalization, there should be no modification
+		assert.False(t, result.Modified, "Should not show diff for ignored fields")
+
+		predictedLiveStr := string(result.PredictedLive)
+		normalizedLiveStr := string(result.NormalizedLive)
+
+		// NOTE: Unlike server-side diff, TwoWayDiff/ThreeWayDiff don't normalize outputs
+		// So sessionAffinity WILL still appear in the output bytes, but Modified should be false
+		// because input normalization removed the differences during comparison
+		assert.Contains(t, predictedLiveStr, "sessionAffinity", "sessionAffinity should still appear in output (no output normalization)")
+		assert.Contains(t, normalizedLiveStr, "sessionAffinity", "sessionAffinity should still appear in output (no output normalization)")
+	})
 }

@@ -116,6 +116,7 @@ func TestConfig(config *rest.Config) error {
 func ToUnstructured(obj any) (*unstructured.Unstructured, error) {
 	uObj, err := runtime.NewTestUnstructuredConverter(equality.Semantic).ToUnstructured(obj)
 	if err != nil {
+		//nolint:wrapcheck // wrap outside this function
 		return nil, err
 	}
 	return &unstructured.Unstructured{Object: uObj}, nil
@@ -184,7 +185,7 @@ func ServerResourceForGroupVersionKind(disco discovery.DiscoveryInterface, gvk s
 	retErr := apierrors.NewNotFound(schema.GroupResource{Group: gvk.Group, Resource: gvk.Kind}, "")
 	resources, err := disco.ServerResourcesForGroupVersion(gvk.GroupVersion().String())
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to discover server resources for group version %s: %w", gvk.GroupVersion().String(), err)
 	}
 	for _, r := range resources.APIResources {
 		if r.Kind == gvk.Kind {
@@ -222,6 +223,7 @@ func cleanKubectlOutput(s string) string {
 // WriteKubeConfig takes a rest.Config and writes it as a kubeconfig at the specified path
 func WriteKubeConfig(restConfig *rest.Config, namespace, filename string) error {
 	kubeConfig := NewKubeConfig(restConfig, namespace)
+	// nolint:wrapcheck // wrapped error message would be the same as caller's wrapped message
 	return clientcmd.WriteToFile(*kubeConfig, filename)
 }
 
@@ -245,10 +247,10 @@ func NewKubeConfig(restConfig *rest.Config, namespace string) *clientcmdapi.Conf
 		Clusters: map[string]*clientcmdapi.Cluster{
 			restConfig.Host: {
 				Server:                   restConfig.Host,
-				TLSServerName:            restConfig.TLSClientConfig.ServerName,
-				InsecureSkipTLSVerify:    restConfig.TLSClientConfig.Insecure,
-				CertificateAuthority:     restConfig.TLSClientConfig.CAFile,
-				CertificateAuthorityData: restConfig.TLSClientConfig.CAData,
+				TLSServerName:            restConfig.ServerName,
+				InsecureSkipTLSVerify:    restConfig.Insecure,
+				CertificateAuthority:     restConfig.CAFile,
+				CertificateAuthorityData: restConfig.CAData,
 				ProxyURL:                 proxyUrl,
 			},
 		},
@@ -263,20 +265,20 @@ func NewKubeConfig(restConfig *rest.Config, namespace string) *clientcmdapi.Conf
 func newAuthInfo(restConfig *rest.Config) *clientcmdapi.AuthInfo {
 	authInfo := clientcmdapi.AuthInfo{}
 	haveCredentials := false
-	if restConfig.TLSClientConfig.CertFile != "" {
-		authInfo.ClientCertificate = restConfig.TLSClientConfig.CertFile
+	if restConfig.CertFile != "" {
+		authInfo.ClientCertificate = restConfig.CertFile
 		haveCredentials = true
 	}
-	if len(restConfig.TLSClientConfig.CertData) > 0 {
-		authInfo.ClientCertificateData = restConfig.TLSClientConfig.CertData
+	if len(restConfig.CertData) > 0 {
+		authInfo.ClientCertificateData = restConfig.CertData
 		haveCredentials = true
 	}
-	if restConfig.TLSClientConfig.KeyFile != "" {
-		authInfo.ClientKey = restConfig.TLSClientConfig.KeyFile
+	if restConfig.KeyFile != "" {
+		authInfo.ClientKey = restConfig.KeyFile
 		haveCredentials = true
 	}
-	if len(restConfig.TLSClientConfig.KeyData) > 0 {
-		authInfo.ClientKeyData = restConfig.TLSClientConfig.KeyData
+	if len(restConfig.KeyData) > 0 {
+		authInfo.ClientKeyData = restConfig.KeyData
 		haveCredentials = true
 	}
 	if restConfig.Username != "" {

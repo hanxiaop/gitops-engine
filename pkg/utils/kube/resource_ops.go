@@ -39,7 +39,7 @@ import (
 
 // ResourceOperations provides methods to manage k8s resources
 type ResourceOperations interface {
-	ApplyResource(ctx context.Context, obj *unstructured.Unstructured, dryRunStrategy cmdutil.DryRunStrategy, force bool, validate bool, serverSideApply bool, manager string) (string, error)
+	ApplyResource(ctx context.Context, obj *unstructured.Unstructured, dryRunStrategy cmdutil.DryRunStrategy, force, validate, serverSideApply bool, manager string) (string, error)
 	ReplaceResource(ctx context.Context, obj *unstructured.Unstructured, dryRunStrategy cmdutil.DryRunStrategy, force bool) (string, error)
 	CreateResource(ctx context.Context, obj *unstructured.Unstructured, dryRunStrategy cmdutil.DryRunStrategy, validate bool) (string, error)
 	UpdateResource(ctx context.Context, obj *unstructured.Unstructured, dryRunStrategy cmdutil.DryRunStrategy) (*unstructured.Unstructured, error)
@@ -73,15 +73,15 @@ func maybeLogManifest(manifestBytes []byte, log logr.Logger) error {
 		var obj unstructured.Unstructured
 		err := json.Unmarshal(manifestBytes, &obj)
 		if err != nil {
-			return err
+			return fmt.Errorf("failed to unmarshal object: %w", err)
 		}
 		redacted, _, err := diff.HideSecretData(&obj, nil, nil)
 		if err != nil {
-			return err
+			return fmt.Errorf("failed to hide secret data: %w", err)
 		}
 		redactedBytes, err := json.Marshal(redacted)
 		if err != nil {
-			return err
+			return fmt.Errorf("failed to marshal redacted object: %w", err)
 		}
 		log.V(1).Info(string(redactedBytes))
 	}
@@ -91,17 +91,17 @@ func maybeLogManifest(manifestBytes []byte, log logr.Logger) error {
 func createManifestFile(obj *unstructured.Unstructured, log logr.Logger) (*os.File, error) {
 	manifestBytes, err := json.Marshal(obj)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to marshal object: %w", err)
 	}
 	manifestFile, err := os.CreateTemp(io.TempDir, "")
 	if err != nil {
-		return nil, fmt.Errorf("Failed to generate temp file for manifest: %w", err)
+		return nil, fmt.Errorf("failed to generate temp file for manifest: %w", err)
 	}
 	if _, err = manifestFile.Write(manifestBytes); err != nil {
-		return nil, fmt.Errorf("Failed to write manifest: %w", err)
+		return nil, fmt.Errorf("failed to write manifest: %w", err)
 	}
 	if err = manifestFile.Close(); err != nil {
-		return nil, fmt.Errorf("Failed to close manifest: %w", err)
+		return nil, fmt.Errorf("failed to close manifest: %w", err)
 	}
 
 	err = maybeLogManifest(manifestBytes, log)
@@ -173,7 +173,7 @@ func (k *kubectlServerSideDiffDryRunApplier) runResourceCommand(obj *unstructure
 	stderr := stderrBuf.String()
 
 	if stderr != "" && stdout == "" {
-		err := fmt.Errorf("Server-side dry run apply had non-empty stderr: %s", stderr)
+		err := fmt.Errorf("server-side dry run apply had non-empty stderr: %s", stderr)
 		k.log.Error(err, "server-side diff")
 		return "", err
 	}
@@ -279,15 +279,15 @@ func (k *kubectlResourceOperations) UpdateResource(ctx context.Context, obj *uns
 	defer span.Finish()
 	dynamicIf, err := dynamic.NewForConfig(k.config)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("error creating dynamic client for config: %w", err)
 	}
 	disco, err := discovery.NewDiscoveryClientForConfig(k.config)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("error creating discovery client for config: %w", err)
 	}
 	apiResource, err := ServerResourceForGroupVersionKind(disco, gvk, "update")
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("error creating discovery client for config: %w", err)
 	}
 	resource := gvk.GroupVersion().WithResource(apiResource.Name)
 	resourceIf := ToResourceInterface(dynamicIf, apiResource, resource, obj.GetNamespace())
@@ -297,11 +297,12 @@ func (k *kubectlResourceOperations) UpdateResource(ctx context.Context, obj *uns
 	case cmdutil.DryRunClient, cmdutil.DryRunServer:
 		updateOptions.DryRun = []string{metav1.DryRunAll}
 	}
+	//nolint:wrapcheck // wrapped error message would be same as caller's wrapped message
 	return resourceIf.Update(ctx, obj, updateOptions)
 }
 
 // ApplyResource performs an apply of a unstructured resource
-func (k *kubectlServerSideDiffDryRunApplier) ApplyResource(_ context.Context, obj *unstructured.Unstructured, dryRunStrategy cmdutil.DryRunStrategy, force bool, validate bool, serverSideApply bool, manager string) (string, error) {
+func (k *kubectlServerSideDiffDryRunApplier) ApplyResource(_ context.Context, obj *unstructured.Unstructured, dryRunStrategy cmdutil.DryRunStrategy, force, validate, serverSideApply bool, manager string) (string, error) {
 	span := k.tracer.StartSpan("ApplyResource")
 	span.SetBaggageItem("kind", obj.GetKind())
 	span.SetBaggageItem("name", obj.GetName())
@@ -357,7 +358,7 @@ func (k *kubectlResourceOperations) ApplyResource(ctx context.Context, obj *unst
 	})
 }
 
-func newApplyOptionsCommon(config *rest.Config, fact cmdutil.Factory, ioStreams genericclioptions.IOStreams, obj *unstructured.Unstructured, fileName string, validate bool, force bool, serverSideApply bool, dryRunStrategy cmdutil.DryRunStrategy, manager string) (*apply.ApplyOptions, error) {
+func newApplyOptionsCommon(config *rest.Config, fact cmdutil.Factory, ioStreams genericclioptions.IOStreams, obj *unstructured.Unstructured, fileName string, validate bool, force, serverSideApply bool, dryRunStrategy cmdutil.DryRunStrategy, manager string) (*apply.ApplyOptions, error) {
 	flags := apply.NewApplyFlags(ioStreams)
 	o := &apply.ApplyOptions{
 		IOStreams:         ioStreams,
@@ -371,12 +372,12 @@ func newApplyOptionsCommon(config *rest.Config, fact cmdutil.Factory, ioStreams 
 	}
 	dynamicClient, err := dynamic.NewForConfig(config)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to create dynamic client: %w", err)
 	}
 	o.DynamicClient = dynamicClient
 	o.DeleteOptions, err = delete.NewDeleteFlags("").ToOptions(dynamicClient, ioStreams)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to create delete flags: %w", err)
 	}
 	o.OpenAPIGetter = fact
 	o.DryRunStrategy = dryRunStrategy
@@ -387,15 +388,15 @@ func newApplyOptionsCommon(config *rest.Config, fact cmdutil.Factory, ioStreams 
 	}
 	o.Validator, err = fact.Validator(validateDirective)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to create validator: %w", err)
 	}
 	o.Builder = fact.NewBuilder()
 	o.Mapper, err = fact.ToRESTMapper()
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to create restmapper: %w", err)
 	}
 
-	o.DeleteOptions.FilenameOptions.Filenames = []string{fileName}
+	o.DeleteOptions.Filenames = []string{fileName}
 	o.Namespace = obj.GetNamespace()
 	o.DeleteOptions.ForceDeletion = force
 	o.DryRunStrategy = dryRunStrategy
@@ -442,7 +443,7 @@ func (k *kubectlResourceOperations) newApplyOptions(ioStreams genericclioptions.
 		case cmdutil.DryRunClient:
 			err = o.PrintFlags.Complete("%s (dry run)")
 			if err != nil {
-				return nil, err
+				return nil, fmt.Errorf("error configuring client dryrun printer: %w", err)
 			}
 		case cmdutil.DryRunServer:
 			err = o.PrintFlags.Complete("%s (server dry run)")
@@ -464,7 +465,7 @@ func (k *kubectlResourceOperations) newCreateOptions(ioStreams genericclioptions
 
 	recorder, err := o.RecordFlags.ToRecorder()
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("error configuring recorder: %w", err)
 	}
 	o.Recorder = recorder
 
@@ -472,19 +473,19 @@ func (k *kubectlResourceOperations) newCreateOptions(ioStreams genericclioptions
 	case cmdutil.DryRunClient:
 		err = o.PrintFlags.Complete("%s (dry run)")
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("error configuring client dryrun printer: %w", err)
 		}
 	case cmdutil.DryRunServer:
 		err = o.PrintFlags.Complete("%s (server dry run)")
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("error configuring server dryrun printer: %w", err)
 		}
 	}
 	o.DryRunStrategy = dryRunStrategy
 
 	printer, err := o.PrintFlags.ToPrinter()
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("error configuring printer: %w", err)
 	}
 	o.PrintObj = func(obj runtime.Object) error {
 		return printer.PrintObj(obj, o.Out)
@@ -498,18 +499,18 @@ func (k *kubectlResourceOperations) newReplaceOptions(config *rest.Config, f cmd
 
 	recorder, err := o.RecordFlags.ToRecorder()
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("error configuring recorder: %w", err)
 	}
 	o.Recorder = recorder
 
 	dynamicClient, err := dynamic.NewForConfig(config)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("error configuring dynamic client: %w", err)
 	}
 
 	o.DeleteOptions, err = o.DeleteFlags.ToOptions(dynamicClient, o.IOStreams)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("error configuring delete: %w", err)
 	}
 
 	o.Builder = func() *resource.Builder {
@@ -520,25 +521,25 @@ func (k *kubectlResourceOperations) newReplaceOptions(config *rest.Config, f cmd
 	case cmdutil.DryRunClient:
 		err = o.PrintFlags.Complete("%s (dry run)")
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("error configuring client dryrun printer: %w", err)
 		}
 	case cmdutil.DryRunServer:
 		err = o.PrintFlags.Complete("%s (server dry run)")
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("error configuring server dryrun printer: %w", err)
 		}
 	}
 	o.DryRunStrategy = dryRunStrategy
 
 	printer, err := o.PrintFlags.ToPrinter()
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("error configuring printer: %w", err)
 	}
 	o.PrintObj = func(obj runtime.Object) error {
 		return printer.PrintObj(obj, o.Out)
 	}
 
-	o.DeleteOptions.FilenameOptions.Filenames = []string{fileName}
+	o.DeleteOptions.Filenames = []string{fileName}
 	o.Namespace = namespace
 	o.DeleteOptions.ForceDeletion = force
 	return o, nil
@@ -562,12 +563,12 @@ func newReconcileOptions(f cmdutil.Factory, kubeClient *kubernetes.Clientset, fi
 	if o.DryRun {
 		err := o.PrintFlags.Complete("%s (dry run)")
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("error configuring client dryrun printer: %w", err)
 		}
 	}
 	printer, err := o.PrintFlags.ToPrinter()
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("error configuring printer: %w", err)
 	}
 	o.PrintObject = printer.PrintObj
 	return o, nil
@@ -576,7 +577,7 @@ func newReconcileOptions(f cmdutil.Factory, kubeClient *kubernetes.Clientset, fi
 func (k *kubectlResourceOperations) authReconcile(ctx context.Context, obj *unstructured.Unstructured, manifestFile string, dryRunStrategy cmdutil.DryRunStrategy) (string, error) {
 	kubeClient, err := kubernetes.NewForConfig(k.config)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("error creating kube client: %w", err)
 	}
 	// `kubectl auth reconcile` has a side effect of auto-creating namespaces if it doesn't exist.
 	// See: https://github.com/kubernetes/kubernetes/issues/71185. This is behavior which we do
@@ -585,7 +586,7 @@ func (k *kubectlResourceOperations) authReconcile(ctx context.Context, obj *unst
 	if dryRunStrategy == cmdutil.DryRunNone && obj.GetNamespace() != "" {
 		_, err = kubeClient.CoreV1().Namespaces().Get(ctx, obj.GetNamespace(), metav1.GetOptions{})
 		if err != nil {
-			return "", err
+			return "", fmt.Errorf("error getting namespace %s: %w", obj.GetNamespace(), err)
 		}
 	}
 	ioStreams := genericclioptions.IOStreams{

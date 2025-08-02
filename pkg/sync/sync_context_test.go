@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -120,6 +121,52 @@ func TestSyncNotPermittedNamespace(t *testing.T) {
 	assert.Contains(t, resources[0].Message, "not permitted in project")
 }
 
+func TestSyncNamespaceCreatedBeforeDryRunWithoutFailure(t *testing.T) {
+	pod := testingutils.NewPod()
+	syncCtx := newTestSyncCtx(nil, WithNamespaceModifier(func(_, _ *unstructured.Unstructured) (bool, error) {
+		return true, nil
+	}))
+	syncCtx.resources = groupResources(ReconciliationResult{
+		Live:   []*unstructured.Unstructured{nil, nil},
+		Target: []*unstructured.Unstructured{pod},
+	})
+	syncCtx.Sync()
+	phase, msg, resources := syncCtx.GetState()
+	assert.Equal(t, synccommon.OperationRunning, phase)
+	assert.Equal(t, "waiting for healthy state of /Namespace/fake-argocd-ns", msg)
+	require.Len(t, resources, 1)
+	assert.Equal(t, "Namespace", resources[0].ResourceKey.Kind)
+	assert.Equal(t, synccommon.ResultCodeSynced, resources[0].Status)
+}
+
+func TestSyncNamespaceCreatedBeforeDryRunWithFailure(t *testing.T) {
+	pod := testingutils.NewPod()
+	syncCtx := newTestSyncCtx(nil, WithNamespaceModifier(func(_, _ *unstructured.Unstructured) (bool, error) {
+		return true, nil
+	}), func(ctx *syncContext) {
+		resourceOps := ctx.resourceOps.(*kubetest.MockResourceOps)
+		resourceOps.Commands = map[string]kubetest.KubectlOutput{}
+		resourceOps.Commands[pod.GetName()] = kubetest.KubectlOutput{
+			Output: "should not be returned",
+			Err:    errors.New("invalid object failing dry-run"),
+		}
+	})
+	syncCtx.resources = groupResources(ReconciliationResult{
+		Live:   []*unstructured.Unstructured{nil, nil},
+		Target: []*unstructured.Unstructured{pod},
+	})
+	syncCtx.Sync()
+	phase, msg, resources := syncCtx.GetState()
+	assert.Equal(t, synccommon.OperationFailed, phase)
+	assert.Equal(t, "one or more objects failed to apply (dry run)", msg)
+	require.Len(t, resources, 2)
+	assert.Equal(t, "Namespace", resources[0].ResourceKey.Kind)
+	assert.Equal(t, synccommon.ResultCodeSynced, resources[0].Status)
+	assert.Equal(t, "Pod", resources[1].ResourceKey.Kind)
+	assert.Equal(t, synccommon.ResultCodeSyncFailed, resources[1].Status)
+	assert.Equal(t, "invalid object failing dry-run", resources[1].Message)
+}
+
 func TestSyncCreateInSortedOrder(t *testing.T) {
 	syncCtx := newTestSyncCtx(nil)
 	syncCtx.resources = groupResources(ReconciliationResult{
@@ -137,9 +184,9 @@ func TestSyncCreateInSortedOrder(t *testing.T) {
 		switch result.ResourceKey.Kind {
 		case "Pod":
 			assert.Equal(t, synccommon.ResultCodeSynced, result.Status)
-			assert.Equal(t, "", result.Message)
+			assert.Empty(t, result.Message)
 		case "Service":
-			assert.Equal(t, "", result.Message)
+			assert.Empty(t, result.Message)
 		default:
 			t.Error("Resource isn't a pod or a service")
 		}
@@ -271,7 +318,7 @@ func TestSyncSuccessfully(t *testing.T) {
 			assert.Equal(t, "pruned", result.Message)
 		case "Service":
 			assert.Equal(t, synccommon.ResultCodeSynced, result.Status)
-			assert.Equal(t, "", result.Message)
+			assert.Empty(t, result.Message)
 		default:
 			t.Error("Resource isn't a pod or a service")
 		}
@@ -959,7 +1006,7 @@ func TestUnnamedHooksGetUniqueNames(t *testing.T) {
 		assert.Len(t, tasks, 2)
 		assert.Contains(t, tasks[0].name(), "foobarb-presync-")
 		assert.Contains(t, tasks[1].name(), "foobarb-postsync-")
-		assert.Equal(t, "", pod.GetName())
+		assert.Empty(t, pod.GetName())
 	})
 
 	t.Run("Short revision", func(t *testing.T) {
@@ -975,7 +1022,7 @@ func TestUnnamedHooksGetUniqueNames(t *testing.T) {
 		assert.Len(t, tasks, 2)
 		assert.Contains(t, tasks[0].name(), "foobar-presync-")
 		assert.Contains(t, tasks[1].name(), "foobar-postsync-")
-		assert.Equal(t, "", pod.GetName())
+		assert.Empty(t, pod.GetName())
 	})
 }
 
@@ -993,8 +1040,8 @@ func TestManagedResourceAreNotNamed(t *testing.T) {
 
 	assert.True(t, successful)
 	assert.Len(t, tasks, 1)
-	assert.Equal(t, "", tasks[0].name())
-	assert.Equal(t, "", pod.GetName())
+	assert.Empty(t, tasks[0].name())
+	assert.Empty(t, pod.GetName())
 }
 
 func TestDeDupingTasks(t *testing.T) {
@@ -1026,7 +1073,7 @@ func TestObjectsGetANamespace(t *testing.T) {
 	assert.True(t, successful)
 	assert.Len(t, tasks, 1)
 	assert.Equal(t, testingutils.FakeArgoCDNamespace, tasks[0].namespace())
-	assert.Equal(t, "", pod.GetNamespace())
+	assert.Empty(t, pod.GetNamespace())
 }
 
 func TestNamespaceAutoCreation(t *testing.T) {
@@ -1044,7 +1091,7 @@ func TestNamespaceAutoCreation(t *testing.T) {
 
 	// Namespace auto creation pre-sync task should not be there
 	// since there is namespace resource in syncCtx.resources
-	t.Run("no pre-sync task 1", func(t *testing.T) {
+	t.Run("no pre-sync task if resource is managed", func(t *testing.T) {
 		syncCtx.resources = groupResources(ReconciliationResult{
 			Live:   []*unstructured.Unstructured{nil},
 			Target: []*unstructured.Unstructured{namespace},
@@ -1056,9 +1103,8 @@ func TestNamespaceAutoCreation(t *testing.T) {
 		assert.NotContains(t, tasks, task)
 	})
 
-	// Namespace auto creation pre-sync task should not be there
-	// since there is no existing sync result
-	t.Run("no pre-sync task 2", func(t *testing.T) {
+	// Namespace auto creation pre-sync task should be there when it is not managed
+	t.Run("pre-sync task when resource is not managed", func(t *testing.T) {
 		syncCtx.resources = groupResources(ReconciliationResult{
 			Live:   []*unstructured.Unstructured{nil},
 			Target: []*unstructured.Unstructured{pod},
@@ -1066,13 +1112,12 @@ func TestNamespaceAutoCreation(t *testing.T) {
 		tasks, successful := syncCtx.getSyncTasks()
 
 		assert.True(t, successful)
-		assert.Len(t, tasks, 1)
-		assert.NotContains(t, tasks, task)
+		assert.Len(t, tasks, 2)
+		assert.Contains(t, tasks, task)
 	})
 
-	// Namespace auto creation pre-sync task should be there
-	// since there is existing sync result which means that task created this namespace
-	t.Run("pre-sync task created", func(t *testing.T) {
+	// Namespace auto creation pre-sync task should be there after sync
+	t.Run("pre-sync task when resource is not managed with existing sync", func(t *testing.T) {
 		syncCtx.resources = groupResources(ReconciliationResult{
 			Live:   []*unstructured.Unstructured{nil},
 			Target: []*unstructured.Unstructured{pod},
@@ -1099,24 +1144,13 @@ func TestNamespaceAutoCreation(t *testing.T) {
 
 	// Namespace auto creation pre-sync task not should be there
 	// since there is no namespace modifier present
-	t.Run("no pre-sync task created", func(t *testing.T) {
+	t.Run("no pre-sync task created if no modifier", func(t *testing.T) {
 		syncCtx.resources = groupResources(ReconciliationResult{
 			Live:   []*unstructured.Unstructured{nil},
 			Target: []*unstructured.Unstructured{pod},
 		})
-		syncCtx.syncNamespace = nil
 
-		res := synccommon.ResourceSyncResult{
-			ResourceKey: kube.GetResourceKey(task.obj()),
-			Version:     task.version(),
-			Status:      task.syncStatus,
-			Message:     task.message,
-			HookType:    task.hookType(),
-			HookPhase:   task.operationState,
-			SyncPhase:   task.phase,
-		}
-		syncCtx.syncRes = map[string]synccommon.ResourceSyncResult{}
-		syncCtx.syncRes[task.resultKey()] = res
+		syncCtx.syncNamespace = nil
 
 		tasks, successful := syncCtx.getSyncTasks()
 
@@ -1197,39 +1231,6 @@ func TestNamespaceAutoCreationForNonExistingNs(t *testing.T) {
 			waveOverride:   nil,
 		}, tasks[0])
 	})
-
-	t.Run("pre-sync task error should be ignored if skip dryrun is true", func(t *testing.T) {
-		syncCtx.resources = groupResources(ReconciliationResult{
-			Live:   []*unstructured.Unstructured{nil},
-			Target: []*unstructured.Unstructured{pod},
-		})
-
-		fakeDisco := syncCtx.disco.(*fakedisco.FakeDiscovery)
-		fakeDisco.Resources = []*metav1.APIResourceList{}
-		syncCtx.disco = fakeDisco
-
-		syncCtx.skipDryRun = true
-		creatorCalled := false
-		syncCtx.syncNamespace = func(_, _ *unstructured.Unstructured) (bool, error) {
-			creatorCalled = true
-			return true, errors.New("some error")
-		}
-		tasks, successful := syncCtx.getSyncTasks()
-
-		assert.True(t, creatorCalled)
-		assert.True(t, successful)
-		assert.Len(t, tasks, 2)
-		assert.Equal(t, &syncTask{
-			phase:          synccommon.SyncPhasePreSync,
-			liveObj:        nil,
-			targetObj:      tasks[0].targetObj,
-			skipDryRun:     true,
-			syncStatus:     synccommon.ResultCodeSyncFailed,
-			operationState: synccommon.OperationError,
-			message:        "namespaceModifier error: some error",
-			waveOverride:   nil,
-		}, tasks[0])
-	})
 }
 
 func createNamespaceTask(namespace string) (*syncTask, error) {
@@ -1237,7 +1238,10 @@ func createNamespaceTask(namespace string) (*syncTask, error) {
 	unstructuredObj, err := kube.ToUnstructured(nsSpec)
 
 	task := &syncTask{phase: synccommon.SyncPhasePreSync, targetObj: unstructuredObj}
-	return task, err
+	if err != nil {
+		return task, fmt.Errorf("failed to convert namespace spec to unstructured: %w", err)
+	}
+	return task, nil
 }
 
 func TestSyncFailureHookWithSuccessfulSync(t *testing.T) {
@@ -2178,5 +2182,83 @@ func BenchmarkSync(b *testing.B) {
 
 		b.StartTimer()
 		syncCtx.Sync()
+	}
+}
+
+func TestNeedsClientSideApplyMigration(t *testing.T) {
+	syncCtx := newTestSyncCtx(nil)
+
+	tests := []struct {
+		name     string
+		liveObj  *unstructured.Unstructured
+		expected bool
+	}{
+		{
+			name:     "nil object",
+			liveObj:  nil,
+			expected: false,
+		},
+		{
+			name:     "object with no managed fields",
+			liveObj:  testingutils.NewPod(),
+			expected: false,
+		},
+		{
+			name: "object with kubectl-client-side-apply fields",
+			liveObj: func() *unstructured.Unstructured {
+				obj := testingutils.NewPod()
+				obj.SetManagedFields([]metav1.ManagedFieldsEntry{
+					{
+						Manager:   "kubectl-client-side-apply",
+						Operation: metav1.ManagedFieldsOperationUpdate,
+						FieldsV1:  &metav1.FieldsV1{Raw: []byte(`{"f:metadata":{"f:annotations":{}}}`)},
+					},
+				})
+				return obj
+			}(),
+			expected: true,
+		},
+		{
+			name: "object with only argocd-controller fields",
+			liveObj: func() *unstructured.Unstructured {
+				obj := testingutils.NewPod()
+				obj.SetManagedFields([]metav1.ManagedFieldsEntry{
+					{
+						Manager:   "argocd-controller",
+						Operation: metav1.ManagedFieldsOperationApply,
+						FieldsV1:  &metav1.FieldsV1{Raw: []byte(`{"f:spec":{"f:replicas":{}}}`)},
+					},
+				})
+				return obj
+			}(),
+			expected: false,
+		},
+		{
+			name: "object with mixed field managers",
+			liveObj: func() *unstructured.Unstructured {
+				obj := testingutils.NewPod()
+				obj.SetManagedFields([]metav1.ManagedFieldsEntry{
+					{
+						Manager:   "kubectl-client-side-apply",
+						Operation: metav1.ManagedFieldsOperationUpdate,
+						FieldsV1:  &metav1.FieldsV1{Raw: []byte(`{"f:metadata":{"f:annotations":{}}}`)},
+					},
+					{
+						Manager:   "argocd-controller",
+						Operation: metav1.ManagedFieldsOperationApply,
+						FieldsV1:  &metav1.FieldsV1{Raw: []byte(`{"f:spec":{"f:replicas":{}}}`)},
+					},
+				})
+				return obj
+			}(),
+			expected: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := syncCtx.needsClientSideApplyMigration(tt.liveObj, "kubectl-client-side-apply")
+			assert.Equal(t, tt.expected, result)
+		})
 	}
 }

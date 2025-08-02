@@ -75,30 +75,6 @@ func (r *Resource) toOwnerRef() metav1.OwnerReference {
 	return metav1.OwnerReference{UID: r.Ref.UID, Name: r.Ref.Name, Kind: r.Ref.Kind, APIVersion: r.Ref.APIVersion}
 }
 
-func newResourceKeySet(set map[kube.ResourceKey]bool, keys ...kube.ResourceKey) map[kube.ResourceKey]bool {
-	newSet := make(map[kube.ResourceKey]bool)
-	for k, v := range set {
-		newSet[k] = v
-	}
-	for i := range keys {
-		newSet[keys[i]] = true
-	}
-	return newSet
-}
-
-func (r *Resource) iterateChildren(ns map[kube.ResourceKey]*Resource, parents map[kube.ResourceKey]bool, action func(err error, child *Resource, namespaceResources map[kube.ResourceKey]*Resource) bool) {
-	for childKey, child := range ns {
-		if r.isParentOf(ns[childKey]) {
-			if parents[childKey] {
-				key := r.ResourceKey()
-				_ = action(fmt.Errorf("circular dependency detected. %s is child and parent of %s", childKey.String(), key.String()), child, ns)
-			} else if action(nil, child, ns) {
-				child.iterateChildren(ns, newResourceKeySet(parents, r.ResourceKey()), action)
-			}
-		}
-	}
-}
-
 // iterateChildrenV2 is a depth-first traversal of the graph of resources starting from the current resource.
 func (r *Resource) iterateChildrenV2(graph map[kube.ResourceKey]map[types.UID]*Resource, ns map[kube.ResourceKey]*Resource, visited map[kube.ResourceKey]int, action func(err error, child *Resource, namespaceResources map[kube.ResourceKey]*Resource) bool) {
 	key := r.ResourceKey()
@@ -118,10 +94,11 @@ func (r *Resource) iterateChildrenV2(graph map[kube.ResourceKey]map[types.UID]*R
 	for _, c := range children {
 		childKey := c.ResourceKey()
 		child := ns[childKey]
-		if visited[childKey] == 1 {
+		switch visited[childKey] {
+		case 1:
 			// Since we encountered a node that we're currently processing, we know we have a circular dependency.
 			_ = action(fmt.Errorf("circular dependency detected. %s is child and parent of %s", childKey.String(), key.String()), child, ns)
-		} else if visited[childKey] == 0 {
+		case 0:
 			if action(nil, child, ns) {
 				child.iterateChildrenV2(graph, ns, visited, action)
 			}
